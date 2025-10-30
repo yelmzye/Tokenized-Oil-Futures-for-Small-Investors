@@ -9,6 +9,8 @@
 (define-constant err-insufficient-payment (err u105))
 (define-constant err-invalid-amount (err u106))
 (define-constant err-unauthorized (err u107))
+(define-constant err-invalid-percentage (err u108))
+(define-constant err-already-settled (err u109))
 
 (define-data-var contract-active bool true)
 (define-data-var oil-price-usd uint u75000)
@@ -264,4 +266,95 @@
     settlement-price: (var-get settlement-price),
     is-settlement-active: (>= stacks-block-height (var-get contract-expiry))
   }
+)
+
+(define-read-only (calculate-partial-settlement (contract-id uint) (percentage uint))
+  (match (map-get? futures-contracts contract-id)
+    contract-data
+    (let
+      (
+        (amount (get amount contract-data))
+        (strike-price (get strike-price contract-data))
+        (current-price (var-get oil-price-usd))
+        (partial-amount (/ (* amount percentage) u100))
+        (profit-per-unit (if (> current-price strike-price)
+                            (- current-price strike-price)
+                            u0))
+        (partial-profit (* partial-amount profit-per-unit))
+      )
+      (ok {
+        partial-amount: partial-amount,
+        partial-profit: partial-profit,
+        remaining-amount: (- amount partial-amount)
+      })
+    )
+    err-not-found
+  )
+)
+
+(define-public (settle-contract-partially (contract-id uint) (percentage uint))
+  (match (map-get? futures-contracts contract-id)
+    contract-data
+    (let
+      (
+        (owner (get owner contract-data))
+        (amount (get amount contract-data))
+        (strike-price (get strike-price contract-data))
+        (current-price (var-get oil-price-usd))
+        (partial-amount (/ (* amount percentage) u100))
+        (remaining-amount (- amount partial-amount))
+        (profit-per-unit (if (> current-price strike-price)
+                            (- current-price strike-price)
+                            u0))
+        (partial-profit (* partial-amount profit-per-unit))
+        (user-pos (get-user-position owner))
+      )
+      (asserts! (is-eq tx-sender owner) err-unauthorized)
+      (asserts! (not (get settled contract-data)) err-already-settled)
+      (asserts! (and (> percentage u0) (<= percentage u100)) err-invalid-percentage)
+      (asserts! (> partial-amount u0) err-invalid-amount)
+      
+      (try! (ft-burn? oil-future-token partial-amount owner))
+      
+      (if (> partial-profit u0)
+        (try! (as-contract (stx-transfer? partial-profit tx-sender owner)))
+        true
+      )
+      
+      (if (is-eq remaining-amount u0)
+        (begin
+          (map-set futures-contracts contract-id
+            (merge contract-data {settled: true, amount: u0})
+          )
+          (map-set user-positions owner
+            (merge user-pos
+              {
+                active-contracts: (- (get active-contracts user-pos) u1),
+                total-returns: (+ (get total-returns user-pos) partial-profit)
+              }
+            )
+          )
+        )
+        (begin
+          (map-set futures-contracts contract-id
+            (merge contract-data {amount: remaining-amount})
+          )
+          (map-set user-positions owner
+            (merge user-pos
+              {
+                total-returns: (+ (get total-returns user-pos) partial-profit)
+              }
+            )
+          )
+        )
+      )
+      
+      (ok {
+        settled-amount: partial-amount,
+        profit: partial-profit,
+        remaining: remaining-amount
+      })
+    )
+    err-not-found
+  )
 )
